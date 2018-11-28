@@ -1,0 +1,1331 @@
+diff --git a/Makefile b/Makefile
+index 9bcdc93..6df94e4 100644
+--- a/Makefile
++++ b/Makefile
+@@ -53,6 +53,7 @@ ifneq ($(KERNELRELEASE), )
+ 	vrouter-y += linux/vrouter_mod.o linux/vhost_dev.o
+ 	vrouter-y += linux/vr_host_interface.o linux/vr_genetlink.o
+ 	vrouter-y += linux/vr_mem.o linux/vr_fragment_assembler.o
++	vrouter-y += linux/vr_offloads.o
+ 
+ 	vrouter-y += dp-core/vr_message.o dp-core/vr_sandesh.o
+ 	vrouter-y += dp-core/vr_queue.o dp-core/vr_index_table.o
+diff --git a/dp-core/vr_flow.c b/dp-core/vr_flow.c
+index 71a9822..433f4c2 100644
+--- a/dp-core/vr_flow.c
++++ b/dp-core/vr_flow.c
+@@ -19,6 +19,8 @@
+ #include "vr_hash.h"
+ #include "vr_ip_mtrie.h"
+ 
++#include "vr_offloads.h"
++
+ #define VR_NUM_FLOW_TABLES          1
+ 
+ #define VR_NUM_OFLOW_TABLES         1
+@@ -179,7 +181,12 @@ vr_flow_reset_mirror(struct vrouter *router, struct vr_flow_entry *fe,
+     if (fe->fe_flags & VR_FLOW_FLAG_MIRROR) {
+         fe->fe_mirror_id = VR_MAX_MIRROR_INDICES;
+         fe->fe_sec_mirror_id = VR_MAX_MIRROR_INDICES;
+-        vr_mirror_meta_entry_del(router, index);
++        if (fe->fe_mme) {
++            vr_mirror_meta_entry_del(router, fe->fe_mme);
++            /* XXX: Index corruption may result after eviction - see 505bafc1 */
++            (void)vr_offload_flow_meta_data_set(index, 0, 0, 0);
++            fe->fe_mme = NULL;
++        }
+     }
+     fe->fe_flags &= ~VR_FLOW_FLAG_MIRROR;
+     fe->fe_mirror_id = VR_MAX_MIRROR_INDICES;
+@@ -210,6 +217,8 @@ __vr_flow_reset_entry(struct vrouter *router, struct vr_flow_entry *fe)
+     fe->fe_hold_list = NULL;
+     fe->fe_key.flow_key_len = 0;
+ 
++    (void)vr_offload_flow_del(fe);
++
+     vr_flow_reset_mirror(router, fe, fe->fe_hentry.hentry_index);
+     fe->fe_ecmp_nh_index = -1;
+     fe->fe_src_nh_index = NH_DISCARD_ID;
+@@ -788,6 +797,9 @@ vr_rflow_update_ecmp_index(struct vrouter *router, struct vr_flow_entry *fe,
+ 
+     fmd->fmd_ecmp_src_nh_index = new_ecmp_index;
+ 
++    /* Update hardware reverse flow. */
++    (void)vr_offload_flow_set(rfe, fe->fe_rflow, NULL);
++
+     return 0;
+ }
+ 
+@@ -1421,6 +1433,41 @@ vr_flow_fat_flow_lookup(struct vrouter *router, struct vr_packet *pkt,
+     return vif_fat_flow_lookup(vif_l, l4_proto, sport, dport);
+ }
+ 
++/*
++ * Called by offload module to update flow stats with packets which have been
++ * offloaded.  over_flow_bytes accounts for overflows which happen in firmware
++ * between updates using this function.
++ */
++int
++vr_flow_incr_stats(int fe_index, uint32_t flow_bytes, uint16_t over_flow_bytes,
++                   uint32_t flow_packets)
++{
++    struct vrouter *router = vrouter_get(0);
++    struct vr_flow_entry *fe;
++    uint32_t new_stats;
++
++    if (router == NULL)
++        return -EINVAL;
++
++    fe = vr_flow_get_entry(router, fe_index);
++    if (fe == NULL)
++        return -ENOENT;
++
++    if (!(fe->fe_flags & VR_FLOW_FLAG_ACTIVE))
++        return -ENOENT;
++
++    new_stats = __sync_add_and_fetch(&fe->fe_stats.flow_bytes, flow_bytes);
++    if (new_stats < flow_bytes)
++        ++fe->fe_stats.flow_bytes_oflow;
++    fe->fe_stats.flow_bytes_oflow += over_flow_bytes;
++
++    new_stats = __sync_add_and_fetch(&fe->fe_stats.flow_packets, flow_packets);
++    if (new_stats < flow_packets)
++        ++fe->fe_stats.flow_packets_oflow;
++
++    return 0;
++}
++
+ static flow_result_t
+ vr_do_flow_lookup(struct vrouter *router, struct vr_packet *pkt,
+                 struct vr_forwarding_md *fmd)
+@@ -1653,11 +1700,22 @@ vr_flow_set_mirror(struct vrouter *router, vr_flow_req *req,
+         }
+     }
+ 
+-    if (req->fr_pcap_meta_data_size && req->fr_pcap_meta_data)
+-        vr_mirror_meta_entry_set(router, req->fr_index,
++    if (req->fr_pcap_meta_data_size && req->fr_pcap_meta_data){
++        if (fe->fe_mme) {
++            vr_mirror_meta_entry_del(router, fe->fe_mme);
++            fe->fe_mme = NULL;
++        }
++
++        fe->fe_mme = vr_mirror_meta_entry_set(router, req->fr_index,
+                 req->fr_mir_sip, req->fr_mir_sport,
+                 req->fr_pcap_meta_data, req->fr_pcap_meta_data_size,
+                 req->fr_mir_vrf);
++        if (fe->fe_mme)
++            (void)vr_offload_flow_meta_data_set(req->fr_index,
++                                                req->fr_pcap_meta_data_size,
++                                                req->fr_pcap_meta_data,
++                                                req->fr_mir_vrf);
++    }
+ 
+     return;
+ }
+@@ -2002,6 +2060,7 @@ vr_flow_set(struct vrouter *router, vr_flow_req *req,
+     if (fe) {
+         if (!(modified = vr_flow_start_modify(router, fe)))
+             return -EBUSY;
++        fe_index = (unsigned int)(req->fr_index);
+     }
+ 
+     if ((ret = vr_flow_set_req_is_invalid(router, req, fe)))
+@@ -2137,6 +2196,14 @@ vr_flow_set(struct vrouter *router, vr_flow_req *req,
+ 
+     ret = vr_flow_schedule_transition(router, req, fe);
+ 
++    /*
++     * offload, no need to differentiate between add and modify. Pass the
++     * reverse flow as well if present.
++     */
++    if (!ret) {
++        (void)vr_offload_flow_set(fe, fe_index, rfe);
++    }
++
+ exit_set:
+     if (modified && fe) {
+         vr_flow_stop_modify(router, fe);
+diff --git a/dp-core/vr_interface.c b/dp-core/vr_interface.c
+index dce271a..805ba17 100644
+--- a/dp-core/vr_interface.c
++++ b/dp-core/vr_interface.c
+@@ -16,6 +16,7 @@
+ #include "vr_btable.h"
+ 
+ unsigned int vr_interfaces = VR_MAX_INTERFACES;
++#include "vr_offloads.h"
+ 
+ volatile bool agent_alive = false;
+ 
+@@ -1762,6 +1763,8 @@ vr_interface_delete(vr_interface_req *req, bool need_response)
+     if (!vif && (ret = -ENODEV))
+         goto del_fail;
+ 
++    (void)vr_offload_interface_del(vif);
++
+     vif_delete(vif);
+ 
+ del_fail:
+@@ -1942,6 +1945,10 @@ vr_interface_add(vr_interface_req *req, bool need_response)
+     vif = __vrouter_get_interface(router, req->vifr_idx);
+     if (vif) {
+         ret = vr_interface_change(vif, req);
++        /* notify hw offload of change, if enabled */
++        if (!ret)
++            ret = vr_offload_interface_add(vif);
++
+         goto generate_resp;
+     }
+ 
+@@ -2061,6 +2068,15 @@ vr_interface_add(vr_interface_req *req, bool need_response)
+     if (!ret)
+         vrouter_setup_vif(vif);
+ 
++    /* notify hw offload of change, if enabled */
++    if (!ret) {
++        ret = vr_offload_interface_add(vif);
++        if (ret) {
++            vif_delete(vif);
++            vif = NULL;
++        }
++    }
++
+ error:
+     if (ret && vif)
+         vif_free(vif);
+@@ -2151,6 +2167,7 @@ __vr_interface_make_req(vr_interface_req *req, struct vr_interface *intf,
+     req->vifr_transport = intf->vif_transport;
+     req->vifr_os_idx = intf->vif_os_idx;
+     req->vifr_mtu = intf->vif_mtu;
++    req->vifr_nh_id = intf->vif_nh_id;
+     if (req->vifr_mac_size && req->vifr_mac)
+         memcpy(req->vifr_mac, intf->vif_mac,
+                 MINIMUM(req->vifr_mac_size, sizeof(intf->vif_mac)));
+@@ -2475,6 +2492,10 @@ vr_interface_get(vr_interface_req *req)
+     if (ret < 0)
+         goto generate_response;
+ 
++    /* adds in stats for pkts which were offloaded on NIC and does debug
++       comparison to check if matching entry is programmed on NIC */
++    (void)vr_offload_interface_get(vif_resp);
++
+     mm.vr_mm_object_type[obj_cnt] = VR_INTERFACE_OBJECT_ID;
+     mm.vr_mm_object[obj_cnt] = vif_resp;
+     obj_cnt++;
+@@ -2551,6 +2572,10 @@ vr_interface_dump(vr_interface_req *r)
+         if (vif) {
+             /* zero vifr_core means to sum up all the per-core stats */
+             vr_interface_make_req(resp, vif, (unsigned)(r->vifr_core - 1));
++
++            /* let hw offload fill in relevant fields */
++            (void)vr_offload_interface_get(resp);
++
+             ret = vr_message_dump_object(dumper, VR_INTERFACE_OBJECT_ID, resp);
+             if (ret <= 0)
+                 break;
+diff --git a/dp-core/vr_mirror.c b/dp-core/vr_mirror.c
+index 8e2246a..988e530 100644
+--- a/dp-core/vr_mirror.c
++++ b/dp-core/vr_mirror.c
+@@ -9,6 +9,7 @@
+ #include "vr_sandesh.h"
+ #include "vr_message.h"
+ #include "vr_mirror.h"
++#include "vr_offloads.h"
+ 
+ struct vr_mirror_entry *
+ vrouter_get_mirror(unsigned int rid, unsigned int index)
+@@ -63,6 +64,8 @@ __vr_mirror_del(struct vrouter *router, unsigned int index)
+     }
+     vrouter_put_nexthop(nh);
+ 
++    (void)vr_offload_mirror_del(index);
++
+     return 0;
+ }
+ 
+@@ -127,6 +130,13 @@ vr_mirror_add(vr_mirror_req *req)
+     if (old_nh)
+         vrouter_put_nexthop(old_nh);
+ 
++    /* if offload failed, release the newly added mirror entry.
++     * vrouter_put_mirror() also drops the reference on the nhop.
++     */
++    ret = vr_offload_mirror_add(mirror, req->mirr_index);
++    if (ret)
++        __vr_mirror_del(router, req->mirr_index);
++
+ generate_resp:
+     vr_send_response(ret);
+ 
+@@ -174,6 +184,7 @@ vr_mirror_dump(vr_mirror_req *r)
+         mirror = router->vr_mirrors[i];
+         if (mirror) {
+            vr_mirror_make_req(&req, mirror, i);
++           (void)vr_offload_mirror_get(&req);
+            ret = vr_message_dump_object(dumper, VR_MIRROR_OBJECT_ID, &req);
+            if (ret <= 0)
+                break;
+@@ -205,6 +216,8 @@ vr_mirror_get(vr_mirror_req *req)
+ 
+     if (mirror) {
+         vr_mirror_make_req(req, mirror, req->mirr_index);
++        /* Debug comparison to check if matching entry is programmed on NIC */
++        (void)vr_offload_mirror_get(req);
+     } else
+         req = NULL;
+ 
+diff --git a/dp-core/vr_mpls.c b/dp-core/vr_mpls.c
+index da2769e..5e2fcba 100644
+--- a/dp-core/vr_mpls.c
++++ b/dp-core/vr_mpls.c
+@@ -13,6 +13,7 @@
+ #include "vr_bridge.h"
+ #include "vr_datapath.h"
+ #include "vr_btable.h"
++#include "vr_offloads.h"
+ 
+ unsigned int vr_mpls_labels = VR_DEF_LABELS;
+ 
+@@ -86,6 +87,10 @@ vr_mpls_del(vr_mpls_req *req)
+ 
+     ret =  __vr_mpls_del(router, req->mr_label);
+ 
++    /* notify hw offload of change, if enabled */
++    if (!ret)
++        (void)vr_offload_mpls_del(req->mr_label);
++
+ generate_resp:
+     vr_send_response(ret);
+ 
+@@ -131,6 +136,13 @@ vr_mpls_add(vr_mpls_req *req)
+         && nh->nh_type == NH_ENCAP && !(nh->nh_flags & NH_FLAG_MCAST))
+         vrouter_host->hos_add_mpls(router, req->mr_label);
+ 
++    /* notify hw offload of change, if enabled */
++    if (!ret) {
++        ret = vr_offload_mpls_add(nh, req->mr_label);
++        if (ret)
++            __vr_mpls_del(router, req->mr_label);
++    }
++
+ generate_resp:
+     vr_send_response(ret);
+ 
+@@ -145,6 +157,9 @@ vr_mpls_make_req(vr_mpls_req *req, struct vr_nexthop *nh,
+     req->mr_nhid = nh->nh_id;
+     req->mr_label = label;
+ 
++    /* Debug comparison to check if matching entry is programmed on NIC */
++    (void)vr_offload_mpls_get(req);
++
+     return;
+ }
+ 
+diff --git a/dp-core/vr_nexthop.c b/dp-core/vr_nexthop.c
+index 790ba3f..fc36e5d 100644
+--- a/dp-core/vr_nexthop.c
++++ b/dp-core/vr_nexthop.c
+@@ -17,6 +17,8 @@
+ #include "vr_datapath.h"
+ #include "vr_route.h"
+ #include "vr_hash.h"
++#include "vr_mirror.h"
++#include "vr_offloads.h"
+ 
+ extern bool vr_has_to_fragment(struct vr_interface *, struct vr_packet *,
+         unsigned int);
+@@ -2365,6 +2367,7 @@ vr_nexthop_delete(vr_nexthop_req *req)
+     if (!nh) {
+         ret = -EINVAL;
+     } else {
++        (void)vr_offload_nexthop_del(nh);
+         vrouter_put_nexthop(nh);
+         nh->nh_destructor(nh);
+     }
+@@ -2994,6 +2997,15 @@ vr_nexthop_add(vr_nexthop_req *req)
+         nh->nh_flags |= NH_FLAG_VALID;
+ 
+     ret = vrouter_add_nexthop(nh);
++
++    if (ret) {
++        nh->nh_destructor(nh);
++        goto generate_resp;
++    }
++    else /* notify hw offload of change, if enabled */
++        ret = vr_offload_nexthop_add(nh);
++
++    /* if offload failed, delete kernel entry for consistency */
+     if (ret)
+         nh->nh_destructor(nh);
+ 
+@@ -3278,6 +3290,10 @@ vr_nexthop_get(vr_nexthop_req *req)
+     } else
+         ret = -ENOENT;
+ 
++    /* Debug comparison to check if matching entry is programmed on NIC */
++    if (!ret)
++        (void)vr_offload_nexthop_get(nh, resp);
++
+ generate_response:
+     vr_message_response(VR_NEXTHOP_OBJECT_ID, ret < 0 ? NULL : resp, ret);
+     if (resp)
+@@ -3316,6 +3332,10 @@ vr_nexthop_dump(vr_nexthop_req *r)
+ 
+             resp->h_op = SANDESH_OP_DUMP;
+             ret = vr_nexthop_make_req(resp, nh);
++
++            if (!ret)
++                (void)vr_offload_nexthop_get(nh, resp);
++
+             if (ret || ((ret = vr_message_dump_object(dumper,
+                                 VR_NEXTHOP_OBJECT_ID, resp)) <= 0)) {
+                 vr_nexthop_req_destroy(resp);
+@@ -3450,3 +3470,42 @@ vr_nexthop_init(struct vrouter *router)
+ {
+     return nh_table_init(router);
+ }
++
++/*
++ * Called by offload module to update vrfstats with packets which have been
++ * offloaded.
++ */
++int
++vr_nexthop_update_offload_vrfstats(uint32_t vrfid, uint32_t num_cntrs,
++                               uint64_t *cntrs)
++{
++    uint32_t i;
++    uint64_t *dst_cntr;
++    uint64_t *src_cntr;
++    struct vr_vrf_stats *stats;
++    uint32_t tmp[2];
++    uint64_t tmp64;
++
++    if (!vr_inet_vrf_stats)
++        return 0;
++
++    /* hw offload stats always go to CPU 0 */
++    stats = vr_inet_vrf_stats(vrfid, 0);
++    if (stats && num_cntrs <= sizeof(struct vr_vrf_stats) * sizeof(uint64_t)) {
++        dst_cntr = (uint64_t *)stats;
++        src_cntr = cntrs;
++        for (i = 0; i < num_cntrs; i++) {
++            tmp[0] = (uint32_t)(*src_cntr);
++            tmp[1] = (uint32_t)((*src_cntr) >> 32);
++            tmp[0] = ntohl(tmp[0]);
++            tmp[1] = ntohl(tmp[1]);
++            tmp64 = (uint64_t)tmp[0] |
++                    ((uint64_t)tmp[1] << 32);
++            *dst_cntr += tmp64;
++            src_cntr++;
++            dst_cntr++;
++        }
++    }
++
++    return 0;
++}
+diff --git a/dp-core/vr_qos.c b/dp-core/vr_qos.c
+index 772c83c..1cfefb3 100644
+--- a/dp-core/vr_qos.c
++++ b/dp-core/vr_qos.c
+@@ -13,6 +13,7 @@
+ #include "vr_interface.h"
+ #include "vr_datapath.h"
+ #include "vr_qos.h"
++#include "vr_offloads.h"
+ 
+ unsigned int vr_qos_map_entries = VR_DEF_QOS_MAP_ENTRIES;
+ unsigned int vr_fc_map_entries = VR_DEF_FC_MAP_ENTRIES;
+@@ -270,6 +271,8 @@ vr_qos_map_delete(vr_qos_map_req *req)
+         vr_free(fc_p, VR_QOS_MAP_OBJECT);
+     }
+ 
++    (void)vr_offload_qos_map_del(req);
++
+ generate_response:
+     vr_send_response(ret);
+     return;
+@@ -307,6 +310,9 @@ vr_qos_map_dump(vr_qos_map_req *req)
+         }
+ 
+         vr_qos_map_make_req(i, resp, fc_p);
++
++        (void)vr_offload_qos_map_get(resp);
++
+         ret = vr_message_dump_object(dumper, VR_QOS_MAP_OBJECT_ID, resp);
+         vr_qos_map_req_destroy(resp);
+         if (ret <= 0)
+@@ -345,6 +351,10 @@ vr_qos_map_get(vr_qos_map_req *req)
+     }
+ 
+     vr_qos_map_make_req(req->qmr_id, resp, fc_p);
++
++    /* Debug comparison to check if matching entry is programmed on NIC */
++    (void)vr_offload_qos_map_get(resp);
++
+     vr_message_response(VR_QOS_MAP_OBJECT_ID, resp, ret);
+     if (resp) {
+         vr_qos_map_req_destroy(resp);
+@@ -414,6 +424,13 @@ vr_qos_map_add(vr_qos_map_req *req)
+         fc_e->vfc_valid = 1;
+     }
+ 
++    ret = vr_offload_qos_map_add(req);
++    if (ret) {
++        vr_printf("offload QoS map not supported - not configuring\n");
++        vr_free(fc_p, VR_QOS_MAP_OBJECT);
++        goto generate_response;
++    }
++
+     if (need_set) {
+         vr_qos_map_set_fc(router, req->qmr_id, fc_p);
+     }
+@@ -568,6 +585,7 @@ vr_fc_map_delete(vr_fc_map_req *req)
+     }
+ 
+     memset(fc_p, 0, sizeof(*fc_p));
++    (void)vr_offload_fc_map_del(req);
+     vr_send_response(0);
+ 
+     return;
+@@ -614,6 +632,8 @@ vr_fc_map_dump(vr_fc_map_req *req)
+         resp->fmr_dotonep[0] = fc_p->vfc_dotonep_qos;
+         resp->fmr_queue_id[0] = fc_p->vfc_queue_id;
+ 
++        (void)vr_offload_fc_map_get(resp);
++
+         ret = vr_message_dump_object(dumper, VR_FC_MAP_OBJECT_ID, resp);
+         vr_fc_map_req_destroy(resp);
+         if (ret <= 0)
+@@ -662,6 +682,9 @@ vr_fc_map_get(vr_fc_map_req *req)
+     resp->fmr_dotonep[0] = fc_p->vfc_dotonep_qos;
+     resp->fmr_queue_id[0] = fc_p->vfc_queue_id;
+ 
++    /* Debug comparison to check if matching entry is programmed on NIC */
++    (void)vr_offload_fc_map_get(resp);
++
+ generate_response:
+     vr_message_response(VR_FC_MAP_OBJECT_ID, ret < 0 ? NULL : resp, ret);
+     if (resp)
+@@ -703,6 +726,16 @@ vr_fc_map_add(vr_fc_map_req *req)
+         fc_p->vfc_valid = 1;
+     }
+ 
++    ret = vr_offload_fc_map_add(req);
++    if (ret) {
++        vr_printf("offload FC map not supported - not configuring\n");
++        for (i = 0; i < req->fmr_id_size; i++) {
++            fc_p = vr_fc_map_get_fc(router, req->fmr_id[i]);
++            if (fc_p)
++                memset(fc_p, 0, sizeof(*fc_p));
++        }
++    }
++
+ generate_response:
+     vr_send_response(ret);
+     return;
+diff --git a/dp-core/vr_route.c b/dp-core/vr_route.c
+index 57412e5..a25fbbe 100644
+--- a/dp-core/vr_route.c
++++ b/dp-core/vr_route.c
+@@ -9,6 +9,7 @@
+ #include <vr_route.h>
+ #include "vr_message.h"
+ #include "vr_sandesh.h"
++#include "vr_offloads.h"
+ 
+ unsigned int vr_vrfs = VR_DEF_VRFS;
+ 
+@@ -80,6 +81,10 @@ vr_route_delete(vr_route_req *req)
+         ret = fs->route_del(fs, &vr_req);
+     }
+ 
++    /* notify hw offload of change, if enabled */
++    if (!ret)
++        (void)vr_offload_route_del(req);
++
+ error:
+     vr_send_response(ret);
+ 
+@@ -111,6 +116,13 @@ vr_route_add(vr_route_req *req)
+         ret = fs->route_add(fs, &vr_req);
+     }
+ 
++    /* notify hw offload of change, if enabled */
++    if (!ret) {
++        ret = vr_offload_route_add(req);
++        if (ret)
++            fs->route_del(fs, &vr_req);
++    }
++
+     vr_send_response(ret);
+ 
+     return ret;
+@@ -164,7 +176,9 @@ vr_route_get(vr_route_req *req)
+ 
+         ret = rtable->algo_get(vr_req.rtr_req.rtr_vrf_id, &vr_req);
+     }
+-
++    /* Allow for debug comparison to check if matching entry is programmed on NIC */
++    if (!ret)
++        (void)vr_offload_route_get(req);
+ generate_response:
+     vr_message_response(VR_ROUTE_OBJECT_ID, ret ? NULL : &vr_req, ret);
+     if (mac_mem_free && vr_req.rtr_req.rtr_mac) {
+@@ -221,6 +235,10 @@ vr_route_dump(vr_route_req *req)
+ 
+         ret = rtable->algo_dump(NULL, &vr_req);
+     }
++    /* Allow for debug comparison to check if matching entry is programmed on NIC */
++    if (!ret)
++        (void)vr_offload_route_dump(&vr_req);
++
+     return ret;
+ 
+ generate_error:
+diff --git a/dp-core/vr_stats.c b/dp-core/vr_stats.c
+index 1a53f63..3c248d0 100644
+--- a/dp-core/vr_stats.c
++++ b/dp-core/vr_stats.c
+@@ -7,6 +7,7 @@
+ #include <vr_os.h>
+ #include <vr_types.h>
+ #include <vr_packet.h>
++#include <vr_offloads.h>
+ #include "vr_message.h"
+ #include "vr_btable.h"
+ 
+@@ -125,6 +126,12 @@ vr_drop_stats_get(unsigned int rid, short core)
+         for (cpu = 0; cpu < vr_num_cpus; cpu++) {
+             vr_drop_stats_make_response(response, router->vr_pdrop_stats[cpu]);
+         }
++        /* offload gets added to summed stats */
++        (void)vr_offload_drop_stats_get(response);
++    } else if (core == (unsigned)-2) {
++        /* this allows returning only offloaded stats without
++           changing the current usage of this function */
++        (void)vr_offload_drop_stats_get(response);
+     } else if (core < vr_num_cpus) {
+         /* stats for a specific core */
+         vr_drop_stats_make_response(response, router->vr_pdrop_stats[core]);
+diff --git a/dp-core/vr_vrf_assign.c b/dp-core/vr_vrf_assign.c
+index b31f42d..c6e35ac 100644
+--- a/dp-core/vr_vrf_assign.c
++++ b/dp-core/vr_vrf_assign.c
+@@ -8,6 +8,7 @@
+ #include "vr_message.h"
+ #include "vr_sandesh.h"
+ #include "vr_packet.h"
++#include "vr_offloads.h"
+ #include <vr_interface.h>
+ #include <vr_response.h>
+ 
+@@ -89,6 +90,16 @@ vr_vrf_assign_set(vr_vrf_assign_req *req)
+ 
+     ret = vif_vrf_table_set(vif, req->var_vlan_id, req->var_vif_vrf,
+             req->var_nh_id);
++    if (ret == 0) {
++        ret = vr_offload_vif_vrf_set(req);
++        if (ret) {
++            /*
++             * If the offload fails to set the entry, reset vif_vrf_table.
++             */
++            vif_vrf_table_set(vif, req->var_vlan_id, -1, 0);
++        }
++    }
++
+ exit_set:
+     if (vif)
+         vrouter_put_interface(vif);
+diff --git a/dp-core/vr_vxlan.c b/dp-core/vr_vxlan.c
+index a1f0258..d2fb95e 100644
+--- a/dp-core/vr_vxlan.c
++++ b/dp-core/vr_vxlan.c
+@@ -12,6 +12,7 @@
+ #include "vr_vxlan.h"
+ #include "vr_bridge.h"
+ #include "vr_datapath.h"
++#include "vr_offloads.h"
+ 
+ int
+ vr_vxlan_input(struct vrouter *router, struct vr_packet *pkt,
+@@ -90,6 +91,8 @@ vr_vxlan_make_req(vr_vxlan_req *req, struct vr_nexthop *nh, unsigned int vnid)
+     req->vxlanr_vnid = vnid;
+     if (nh)
+         req->vxlanr_nhid = nh->nh_id;
++    /* Debug comparison to check if matching entry is programmed on NIC */
++    (void)vr_offload_vxlan_get(req);
+     return;
+ }
+ 
+@@ -174,6 +177,9 @@ vr_vxlan_del(vr_vxlan_req *req)
+     if (nh)
+         vrouter_put_nexthop(nh);
+ 
++    /* notify hw offload of change, if enabled */
++    (void)vr_offload_vxlan_del(req->vxlanr_vnid);
++
+ generate_resp:
+     vr_send_response(ret);
+     return ret;
+@@ -199,6 +205,18 @@ vr_vxlan_add(vr_vxlan_req *req)
+     }
+ 
+     nh_old = vr_itable_set(router->vr_vxlan_table, req->vxlanr_vnid, nh);
++
++    ret = vr_offload_vxlan_add(nh, req->vxlanr_vnid);
++    if (ret) {
++        /* If offload add fails, restore old nexthop */
++        if (nh_old && nh_old != VR_ITABLE_ERR_PTR)
++            vr_itable_set(router->vr_vxlan_table, req->vxlanr_vnid, nh_old);
++        else
++            vr_itable_del(router->vr_vxlan_table, req->vxlanr_vnid);
++        vrouter_put_nexthop(nh);
++        goto generate_resp;
++    }
++
+     if (nh_old) {
+         if (nh_old == VR_ITABLE_ERR_PTR) {
+             ret = -EINVAL;
+diff --git a/dp-core/vrouter.c b/dp-core/vrouter.c
+index f9480aa..0ad993f 100644
+--- a/dp-core/vrouter.c
++++ b/dp-core/vrouter.c
+@@ -23,9 +23,11 @@
+ #include <vr_mirror.h>
+ #include <vr_vxlan.h>
+ #include <vr_qos.h>
++#include <vr_offloads.h>
+ 
+ static struct vrouter router;
+ struct host_os *vrouter_host;
++struct vr_offload_ops *offload_ops;
+ 
+ extern struct host_os *vrouter_get_host(void);
+ extern int vr_stats_init(struct vrouter *);
+@@ -497,8 +499,12 @@ init_fail:
+ static int
+ vrouter_soft_reset(void)
+ {
++    int ret = 0;
+     vrouter_exit(true);
+-    return vrouter_init();
++    ret = vrouter_init();
++    if (!ret)
++        ret = vr_offload_soft_reset();
++    return ret;
+ }
+ 
+ void
+diff --git a/include/ini_parser.h b/include/ini_parser.h
+index 12a687b..e99a9a8 100644
+--- a/include/ini_parser.h
++++ b/include/ini_parser.h
+@@ -18,6 +18,8 @@ extern "C" {
+ #define PLATFORM_KEY    "platform"
+ #define PLATFORM_DPDK   "dpdk"
+ #define PLATFORM_NIC    "nic"
++#define OFFLOAD_KEY     "offload"
++#define OFFLOAD_ENABLED "enabled"
+ 
+ extern int read_int(const char *section, const char *key);
+ extern const char *read_string(const char *section, const char *key);
+@@ -32,6 +34,7 @@ extern int get_socket_type(void);
+ extern int get_vrouter_ip(void);
+ extern int get_platform(void);
+ extern const char *get_platform_str(void);
++extern bool get_offload_enabled(void);
+ extern int get_protocol(void);
+ 
+ extern int parse_ini_file(void);
+diff --git a/include/vr_flow.h b/include/vr_flow.h
+index a13df08..6f03b12 100644
+--- a/include/vr_flow.h
++++ b/include/vr_flow.h
+@@ -338,6 +338,7 @@ struct vr_dummy_flow_entry {
+     uint8_t fe_type;
+     unsigned short fe_udp_src_port;
+     uint32_t fe_src_info;
++    struct vr_mirror_meta_entry *fe_mme;;
+ } __attribute__((packed));
+ 
+ #define VR_FLOW_ENTRY_PACK (128 - sizeof(struct vr_dummy_flow_entry))
+@@ -372,6 +373,7 @@ struct vr_flow_entry {
+      * component NH as this source
+      */
+     uint32_t fe_src_info;
++    struct vr_mirror_meta_entry *fe_mme;
+     unsigned char fe_pack[VR_FLOW_ENTRY_PACK];
+ } __attribute__((packed));
+ 
+@@ -480,4 +482,6 @@ int vr_flow_update_ecmp_index(struct vrouter *, struct vr_flow_entry *,
+ uint32_t vr_flow_get_rflow_src_info(struct vrouter *, struct
+         vr_flow_entry *);
+ 
++int vr_flow_incr_stats(int , uint32_t , uint16_t, uint32_t);
++
+ #endif /* __VR_FLOW_H__ */
+diff --git a/include/vr_route.h b/include/vr_route.h
+index 253cab1..c834bfd 100644
+--- a/include/vr_route.h
++++ b/include/vr_route.h
+@@ -110,6 +110,8 @@ extern int vr_route_add(vr_route_req *);
+ extern struct vr_nexthop *(*vr_inet_route_lookup)(unsigned int,
+                struct vr_route_req *);
+ 
++int vr_nexthop_update_offload_vrfstats(uint32_t , uint32_t, uint64_t *);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/include/vr_offloads.h b/include/vr_offloads.h
+new file mode 100644
+index 0000000..09e5ca4
+--- /dev/null
++++ b/include/vr_offloads.h
+@@ -0,0 +1,479 @@
++/*
++ * vr_offloads.h -- register callbacks for hardware offload features
++ *
++ * Copyright (c) 2016 Netronome Systems, Inc. All rights reserved.
++ */
++
++#ifndef __VR_OFFLOADS_H__
++#define __VR_OFFLOADS_H__
++
++#include <vr_os.h>
++#include <vr_types.h>
++#include <vr_defs.h>
++#if defined(__KERNEL__) && defined(__linux__)
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/netdevice.h>
++#endif
++#include <vr_interface.h>
++#include <vr_nexthop.h>
++#include <vr_flow.h>
++#include <vr_mirror.h>
++#include <vr_route.h>
++
++#define VR_OFFLOAD_VER_MAJ 4
++#define VR_OFFLOAD_VER_MIN 1
++#define VR_OFFLOAD_VER_REV 0
++
++#define VR_OFFLOAD_VER ((VR_OFFLOAD_VER_MAJ << 24) | \
++                       (VR_OFFLOAD_VER_MIN << 16) | \
++                       (VR_OFFLOAD_VER_REV << 8))
++
++#if defined(__KERNEL__) && defined(__linux__)
++    #define vr_rcu_dereference(p) rcu_dereference(p)
++#else
++    #define vr_rcu_dereference(p) NULL
++#endif
++
++struct vr_offload_ops {
++    char *voo_handler_id;   /* Hardware vendor identifier */
++
++    /* perform soft reset, including initializing tables */
++    int (*voo_soft_reset)(void);
++
++    /* flow related functions */
++    int (*voo_flow_set)(struct vr_flow_entry *, unsigned int,
++                    struct vr_flow_entry *);
++    int (*voo_flow_del)(struct vr_flow_entry *);
++    int (*voo_flow_meta_data_set)(unsigned int, unsigned int, void *,
++                              unsigned short);
++
++    /* Dropstats */
++    int (*voo_drop_stats_get)(vr_drop_stats_req *response);
++
++    /* Interface */
++    int (*voo_interface_add)(struct vr_interface *);
++    int (*voo_interface_del)(struct vr_interface *);
++    int (*voo_interface_get)(vr_interface_req *);
++
++    /* vif_vrf table */
++    int (*voo_vif_vrf_set)(vr_vrf_assign_req *);
++    int (*voo_vif_vrf_get)(vr_vrf_assign_req *);
++
++    /* MPLS (ILM) */
++    int (*voo_mpls_add)(struct vr_nexthop *, int);
++    int (*voo_mpls_del)(int);
++    int (*voo_mpls_get)(vr_mpls_req *);
++
++    /* VXLAN (VNID) */
++    int (*voo_vxlan_add)(struct vr_nexthop *, int);
++    int (*voo_vxlan_del)(int);
++    int (*voo_vxlan_get)(vr_vxlan_req *);
++
++    /* Mirror table */
++    int (*voo_mirror_add)(struct vr_mirror_entry *, unsigned int);
++    int (*voo_mirror_del)(unsigned int);
++    int (*voo_mirror_get)(vr_mirror_req *);
++
++    /* NHOP */
++    int (*voo_nexthop_add)(struct vr_nexthop *);
++    int (*voo_nexthop_del)(struct vr_nexthop *);
++    int (*voo_nexthop_get)(struct vr_nexthop *, vr_nexthop_req *);
++
++    /* route */
++    int (*voo_route_add)(vr_route_req *);
++    int (*voo_route_del)(vr_route_req *);
++    int (*voo_route_get)(vr_route_req *);
++    int (*voo_route_dump)(struct vr_route_req *);
++
++    /* QoS */
++    int (*voo_fc_map_add)(vr_fc_map_req *);
++    int (*voo_fc_map_del)(vr_fc_map_req *);
++    int (*voo_fc_map_get)(vr_fc_map_req *);
++
++    int (*voo_qos_map_add)(vr_qos_map_req *);
++    int (*voo_qos_map_del)(vr_qos_map_req *);
++    int (*voo_qos_map_get)(vr_qos_map_req *);
++};
++
++extern struct vr_offload_ops *offload_ops;
++
++int vr_offload_version(void);
++int vr_offload_init_handler(void);
++int vr_offload_register(int version, const struct vr_offload_ops *new_handler);
++int vr_offload_unregister(void);
++void vr_offload_cleanup_handler(void);
++
++#if defined(__KERNEL__) && defined(__linux__)
++/* Wrappers for calling offload function with locking in place */
++static inline int vr_offload_soft_reset(void)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_soft_reset)
++        return offload->voo_soft_reset();
++    return 0;
++}
++
++/* Flow offload functions */
++static inline int vr_offload_flow_set(struct vr_flow_entry * fe,
++                                       unsigned int fe_index,
++                                       struct vr_flow_entry * rfe)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_flow_set)
++        return offload->voo_flow_set(fe, fe_index, rfe);
++    return 0;
++}
++
++static inline int vr_offload_flow_del(struct vr_flow_entry * fe)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_flow_del)
++        return offload->voo_flow_del(fe);
++    return 0;
++}
++
++/*
++ * Used both to set and reset meta data entry for a flow.
++ */
++static inline int vr_offload_flow_meta_data_set(unsigned int fe_index,
++                                                 unsigned int meta_data_len,
++                                                 void *meta_data,
++                                                 unsigned short mir_vrf)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_flow_meta_data_set)
++        return offload->voo_flow_meta_data_set(fe_index, meta_data_len,
++                                    meta_data, mir_vrf);
++    return 0;
++}
++
++/* Dropstats */
++static inline int vr_offload_drop_stats_get(vr_drop_stats_req *resp)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_drop_stats_get)
++        return offload->voo_drop_stats_get(resp);
++    return 0;
++}
++
++/* interface offload functions */
++static inline int vr_offload_interface_add(struct vr_interface * intf)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_interface_add)
++        return offload->voo_interface_add(intf);
++    return 0;
++}
++
++static inline int vr_offload_interface_get(vr_interface_req *resp)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_interface_get)
++        return offload->voo_interface_get(resp);
++    return 0;
++}
++
++static inline int vr_offload_interface_del(struct vr_interface * intf)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_interface_del)
++        return offload->voo_interface_del(intf);
++    return 0;
++}
++
++static inline int vr_offload_vif_vrf_set(vr_vrf_assign_req *req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_vif_vrf_set)
++       return offload->voo_vif_vrf_set(req);
++    return 0;
++}
++
++static inline int vr_offload_vif_vrf_get(vr_vrf_assign_req *resp)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_vif_vrf_get)
++        return offload->voo_vif_vrf_get(resp);
++    return 0;
++}
++
++static inline int vr_offload_nexthop_add(struct vr_nexthop * nh)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_nexthop_add)
++        return offload->voo_nexthop_add(nh);
++    return 0;
++}
++
++static inline int vr_offload_nexthop_del(struct vr_nexthop * nh)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_nexthop_del)
++        return offload->voo_nexthop_del(nh);
++    return 0;
++}
++
++static inline int vr_offload_nexthop_get(struct vr_nexthop * nh,
++                                          vr_nexthop_req * resp)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_nexthop_get)
++        return offload->voo_nexthop_get(nh, resp);
++    return 0;
++}
++
++static inline int vr_offload_mpls_add(struct vr_nexthop * nh, int label)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_mpls_add)
++        return offload->voo_mpls_add(nh, label);
++    return 0;
++}
++
++static inline int vr_offload_mpls_get(vr_mpls_req * resp)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_mpls_get)
++        return offload->voo_mpls_get(resp);
++    return 0;
++}
++
++static inline int vr_offload_mpls_del(int label)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_mpls_del)
++        return offload->voo_mpls_del(label);
++    return 0;
++}
++
++static inline int vr_offload_vxlan_add(struct vr_nexthop * nh, int vnid)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++    if (offload && offload->voo_vxlan_add)
++        return offload->voo_vxlan_add(nh, vnid);
++    return 0;
++}
++
++static inline int vr_offload_vxlan_get(vr_vxlan_req * resp)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_vxlan_get)
++        return offload->voo_vxlan_get(resp);
++    return 0;
++}
++
++static inline int vr_offload_vxlan_del(int vnid)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_vxlan_del)
++        return offload->voo_vxlan_del(vnid);
++    return 0;
++}
++
++static inline int vr_offload_mirror_add(struct vr_mirror_entry * mirror,
++                                        unsigned int index)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_mirror_add)
++        return offload->voo_mirror_add(mirror, index);
++    return 0;
++}
++
++static inline int vr_offload_mirror_del(unsigned int index)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_mirror_del)
++        return offload->voo_mirror_del(index);
++    return 0;
++}
++
++static inline int vr_offload_mirror_get(vr_mirror_req * resp)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_mirror_get)
++        return offload->voo_mirror_get(resp);
++    return 0;
++}
++
++static inline int vr_offload_route_del(vr_route_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_route_del)
++        return offload->voo_route_del(req);
++    return 0;
++}
++
++static inline int vr_offload_route_add(vr_route_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_route_add)
++        return offload->voo_route_add(req);
++    return 0;
++}
++
++static inline int vr_offload_route_get(vr_route_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_route_get)
++        return offload->voo_route_get(req);
++    return 0;
++}
++
++static inline int vr_offload_route_dump(struct vr_route_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_route_dump)
++        return offload->voo_route_dump(req);
++    return 0;
++}
++
++static inline int vr_offload_fc_map_add(vr_fc_map_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_fc_map_add)
++        return offload->voo_fc_map_add(req);
++    return 0;
++}
++
++static inline int vr_offload_fc_map_del(vr_fc_map_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_fc_map_del)
++        return offload->voo_fc_map_del(req);
++    return 0;
++}
++
++static inline int vr_offload_fc_map_get(vr_fc_map_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_fc_map_get)
++        return offload->voo_fc_map_get(req);
++    return 0;
++}
++
++static inline int vr_offload_qos_map_add(vr_qos_map_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_qos_map_add)
++        return offload->voo_qos_map_add(req);
++    return 0;
++}
++
++static inline int vr_offload_qos_map_del(vr_qos_map_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_qos_map_del)
++        return offload->voo_qos_map_del(req);
++    return 0;
++}
++
++static inline int vr_offload_qos_map_get(vr_qos_map_req * req)
++{
++    struct vr_offload_ops *offload = vr_rcu_dereference(offload_ops);
++
++    if (offload && offload->voo_qos_map_get)
++        return offload->voo_qos_map_get(req);
++    return 0;
++}
++
++#else
++
++#define vr_offload_soft_reset(...) 0
++
++#define vr_offload_flow_set(...) 0
++
++#define vr_offload_flow_del(...) 0
++
++#define vr_offload_flow_meta_data_set(...) 0
++
++#define vr_offload_drop_stats_get(...) 0
++
++#define vr_offload_interface_add(...) 0
++
++#define vr_offload_interface_get(...) 0
++
++#define vr_offload_interface_del(...) 0
++
++#define vr_offload_vif_vrf_set(...) 0
++
++#define vr_offload_vif_vrf_get(...) 0
++
++#define vr_offload_nexthop_add(...) 0
++
++#define vr_offload_nexthop_del(...) 0
++
++#define vr_offload_nexthop_get(...) 0
++
++#define vr_offload_mpls_add(...) 0
++
++#define vr_offload_mpls_get(...) 0
++
++#define vr_offload_mpls_del(...) 0
++
++#define vr_offload_vxlan_add(...) 0
++
++#define vr_offload_vxlan_get(...) 0
++
++#define vr_offload_vxlan_del(...) 0
++
++#define vr_offload_mirror_add(...) 0
++
++#define vr_offload_mirror_del(...) 0
++
++#define vr_offload_mirror_get(...) 0
++
++#define vr_offload_route_del(...) 0
++
++#define vr_offload_route_add(...) 0
++
++#define vr_offload_route_get(...) 0
++
++#define vr_offload_route_dump(...) 0
++
++#define vr_offload_fc_map_add(...) 0
++
++#define vr_offload_fc_map_del(...) 0
++
++#define vr_offload_fc_map_get(...) 0
++
++#define vr_offload_qos_map_add(...) 0
++
++#define vr_offload_qos_map_del(...) 0
++
++#define vr_offload_qos_map_get(...) 0
++
++#endif
++
++#endif /* __VR_OFFLOADS_H__ */
+diff --git a/linux/vr_offloads.c b/linux/vr_offloads.c
+new file mode 100644
+index 0000000..23e1e57
+--- /dev/null
++++ b/linux/vr_offloads.c
+@@ -0,0 +1,59 @@
++/*
++ * vr_offloads.c -- register callbacks for hardware offload features
++ *
++ * Copyright (c) 2016 Netronome Systems, Inc. All rights reserved.
++ */
++#include "vr_offloads.h"
++
++int
++vr_offload_version(void)
++{
++    return VR_OFFLOAD_VER;
++}
++EXPORT_SYMBOL(vr_offload_version);
++
++/*
++ * Called by offload module to register itself with vrouter.
++ */
++int
++vr_offload_register(int version, const struct vr_offload_ops *new_handler)
++{
++
++    struct vr_offload_ops *offload =
++       rcu_dereference(offload_ops);
++
++    if (version != VR_OFFLOAD_VER)
++        return -EINVAL;
++
++    if (offload)
++        return -EBUSY;
++    offload = kmalloc(sizeof(*offload), GFP_KERNEL);
++    if (!offload)
++        return -ENOMEM;
++    *offload = *new_handler;
++
++    rcu_assign_pointer(offload_ops, offload);
++    return 0;
++}
++EXPORT_SYMBOL(vr_offload_register);
++
++/*
++ * Called by offload module to unregister itself with vrouter.
++ */
++int
++vr_offload_unregister()
++{
++    struct vr_offload_ops *offload =
++       rcu_dereference(offload_ops);
++
++    if (offload) {
++        rcu_assign_pointer(offload_ops, NULL);
++        kfree(offload);
++    }
++    return 0;
++}
++EXPORT_SYMBOL(vr_offload_unregister);
++
++/* Statistics update functions used by offload module */
++EXPORT_SYMBOL(vr_flow_incr_stats);
++EXPORT_SYMBOL(vr_nexthop_update_offload_vrfstats);
